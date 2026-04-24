@@ -1,11 +1,24 @@
 """
-Churn scoring model.
+Churn scoring models.
 
-XGBoost classifier with:
-  - SMOTE oversampling for class imbalance
-  - Platt scaling (isotonic regression) for calibration
-  - SHAP-based feature importance
-  - MLflow experiment tracking
+Two model types:
+  1. XGBHorizonClassifier  — binary classifier for a fixed horizon label
+     (e.g. "will this customer churn within 90 days?")
+     Fixes the calibration data-leak from the original project.
+
+  2. SurvivalModel wrapper  — see survival.py for the lifelines AFT model
+
+Fixes vs original project
+--------------------------
+* Calibration leak fixed: base XGB is fit on a dedicated training split;
+  isotonic calibration is fit on a separate held-out calibration set.
+  CalibratedClassifierCV is NOT used as a refitting wrapper here.
+* SMOTE applied only within the training split, never touching calibration
+  or test data.
+* Training on 71k rows — small-N SMOTE concerns no longer apply, so SMOTE
+  is optional (controlled by use_smote flag).
+* LogisticRegression baseline included for comparison.
+* Threshold optimization via F-beta / cost-weighted sweep.
 """
 
 import warnings
@@ -14,18 +27,18 @@ import pandas as pd
 import mlflow
 import mlflow.sklearn
 import shap
+import joblib
 from pathlib import Path
-
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.calibration import CalibratedClassifierCV, calibration_curve
+from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
 from sklearn.metrics import (
     roc_auc_score, average_precision_score,
     brier_score_loss, classification_report,
-    roc_curve, precision_recall_curve,
+    roc_curve, precision_recall_curve, f1_score,
 )
 from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
 from xgboost import XGBClassifier
 from imblearn.over_sampling import SMOTE
 from imblearn.pipeline import Pipeline as ImbPipeline
@@ -35,169 +48,292 @@ warnings.filterwarnings("ignore")
 MODEL_DIR = Path(__file__).resolve().parents[2] / "models"
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-TARGET = "Churn"
+TARGET    = "churndep"
+HORIZONS  = [30, 60, 90, 180]
 
 
-# ── Model factory ─────────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
-def build_model(
-    n_estimators: int = 300,
-    max_depth: int = 5,
-    learning_rate: float = 0.05,
-    subsample: float = 0.8,
-    colsample_bytree: float = 0.8,
-    scale_pos_weight: float = 2.5,
-    random_state: int = 42,
-) -> ImbPipeline:
-    """
-    XGBoost classifier with SMOTE oversampling in an imbalanced-learn pipeline.
-    Calibration is applied separately after fitting.
-    """
-    xgb = XGBClassifier(
-        n_estimators=n_estimators,
-        max_depth=max_depth,
-        learning_rate=learning_rate,
-        subsample=subsample,
-        colsample_bytree=colsample_bytree,
+def _horizon_target(horizon: int) -> str:
+    return f"churn_{horizon}d"
+
+
+def _get_Xy(df: pd.DataFrame, features: list[str], target_col: str):
+    X = df[features].fillna(0)
+    y = df[target_col]
+    return X, y
+
+
+# ── Logistic Regression baseline ──────────────────────────────────────────────
+
+def train_baseline(
+    train_df:   pd.DataFrame,
+    features:   list[str],
+    horizon:    int = 90,
+) -> Pipeline:
+    """Scaled LogisticRegression baseline for comparison."""
+    target = _horizon_target(horizon)
+    X, y   = _get_Xy(train_df, features, target)
+
+    pipe = Pipeline([
+        ("scaler", StandardScaler()),
+        ("lr",     LogisticRegression(
+            max_iter=1000, class_weight="balanced", random_state=42, n_jobs=-1,
+        )),
+    ])
+    pipe.fit(X, y)
+    return pipe
+
+
+# ── XGBoost horizon classifier ─────────────────────────────────────────────────
+
+def _build_xgb(scale_pos_weight: float = 1.0) -> XGBClassifier:
+    return XGBClassifier(
+        n_estimators=400,
+        max_depth=6,
+        learning_rate=0.04,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=5,
         scale_pos_weight=scale_pos_weight,
         use_label_encoder=False,
         eval_metric="logloss",
-        random_state=random_state,
+        random_state=42,
         verbosity=0,
         n_jobs=-1,
     )
-    pipeline = ImbPipeline([
-        ("smote", SMOTE(random_state=random_state, k_neighbors=5)),
-        ("clf",   xgb),
-    ])
-    return pipeline
 
-
-# ── Training ──────────────────────────────────────────────────────────────────
 
 def train(
-    train_df: pd.DataFrame,
-    features: list[str],
-    experiment_name: str = "churn-monitoring",
-    run_name: str = "baseline",
+    train_df:        pd.DataFrame,
+    features:        list[str],
+    horizon:         int   = 90,
+    use_smote:       bool  = False,
+    experiment_name: str   = "churn-monitoring",
+    run_name:        str   = "xgb_horizon",
 ) -> tuple:
     """
-    Train model, calibrate, log to MLflow.
+    Train XGBoost classifier for a fixed horizon label.
+
+    Calibration is done correctly:
+      1. Split train_df into model_train (70%) and calib_holdout (30%)
+      2. Fit XGBoost on model_train (with optional SMOTE)
+      3. Fit isotonic calibration on calib_holdout predictions only
+         — the base model has never seen calib_holdout during training
+      4. Cross-validation is on model_train only
 
     Returns
     -------
-    model       : fitted ImbPipeline (uncalibrated XGB)
-    calibrated  : CalibratedClassifierCV wrapper
-    shap_values : np.ndarray of SHAP values on training set
-    explainer   : shap.Explainer object
-    metrics     : dict of training metrics
+    model       : fitted XGBClassifier (uncalibrated)
+    calibrated  : isotonic-calibrated wrapper
+    baseline    : LogisticRegression baseline
+    shap_values : SHAP values on model_train X
+    explainer   : shap.TreeExplainer
+    metrics     : dict of CV + train metrics
     """
-    X = train_df[features].fillna(0)
-    y = train_df[TARGET]
+    target = _horizon_target(horizon)
+    X_all, y_all = _get_Xy(train_df, features, target)
+
+    # ── 1. Split into model-train and calibration holdout ─────────
+    X_train, X_calib, y_train, y_calib = train_test_split(
+        X_all, y_all, test_size=0.25, stratify=y_all, random_state=42
+    )
+
+    # ── 2. Optional SMOTE on model-train only ─────────────────────
+    pos_weight = (y_train == 0).sum() / max((y_train == 1).sum(), 1)
+    if use_smote:
+        smote   = SMOTE(random_state=42, k_neighbors=5)
+        X_fit, y_fit = smote.fit_resample(X_train, y_train)
+    else:
+        X_fit, y_fit = X_train, y_train
 
     mlflow.set_experiment(experiment_name)
 
-    with mlflow.start_run(run_name=run_name):
-        # Cross-validated AUROC
-        model = build_model()
-        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    with mlflow.start_run(run_name=f"{run_name}_{horizon}d"):
 
-        # Score on raw XGB (no SMOTE in CV to avoid leakage debate — note in README)
-        xgb_only = build_model()
+        # ── 3. Cross-validate on model-train ─────────────────────
+        xgb_cv = _build_xgb(scale_pos_weight=pos_weight if not use_smote else 1.0)
+        cv      = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
         cv_scores = cross_val_score(
-            xgb_only, X, y, cv=cv, scoring="roc_auc", n_jobs=-1
+            xgb_cv, X_fit, y_fit, cv=cv, scoring="roc_auc", n_jobs=-1
         )
-        print(f"  CV AUROC: {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
+        print(f"  [{horizon}d] CV AUROC: {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
 
-        # Fit on full training set
-        model.fit(X, y)
+        # ── 4. Fit final XGB on full model-train ──────────────────
+        model = _build_xgb(scale_pos_weight=pos_weight if not use_smote else 1.0)
+        model.fit(X_fit, y_fit)
 
-        # Calibrate with isotonic regression on SMOTE-resampled training data
-        X_smoted, y_smoted = model.named_steps["smote"].fit_resample(X, y)
-        from sklearn.base import clone
-        base_clf = clone(model.named_steps["clf"])
-        base_clf.fit(X_smoted, y_smoted)
-        calibrated = CalibratedClassifierCV(
-            base_clf, method="isotonic", cv=5
+        # ── 5. Calibrate on held-out calibration set ──────────────
+        # Predict raw probabilities on calib set (model never saw this data)
+        raw_calib_proba = model.predict_proba(X_calib)[:, 1]
+
+        # Isotonic regression: map raw scores → calibrated probabilities
+        from sklearn.isotonic import IsotonicRegression
+        iso = IsotonicRegression(out_of_bounds="clip")
+        iso.fit(raw_calib_proba, y_calib)
+
+        # Wrap as a callable with predict_proba interface
+        calibrated = _IsotonicWrapper(model, iso)
+
+        # ── 6. Baseline ───────────────────────────────────────────
+        baseline = train_baseline(
+            train_df.__class__(
+                np.hstack([X_train, y_train.values.reshape(-1, 1)]),
+                columns=list(X_train.columns) + [target],
+            ) if False else
+            pd.concat([X_train, y_train], axis=1),
+            features, horizon,
         )
-        calibrated.fit(X_smoted, y_smoted)
 
-        # SHAP on raw XGB
-        explainer = shap.TreeExplainer(model.named_steps["clf"])
-        shap_values = explainer.shap_values(X_smoted)
+        # ── 7. SHAP on model-train ────────────────────────────────
+        explainer   = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X_fit)
 
-        # Training metrics
-        proba = calibrated.predict_proba(X_smoted)[:, 1]
+        # ── 8. Metrics ────────────────────────────────────────────
+        train_proba = calibrated.predict_proba(X_fit)[:, 1]
         metrics = {
-            "train_auroc":    float(roc_auc_score(y_smoted, proba)),
-            "train_auprc":    float(average_precision_score(y_smoted, proba)),
-            "train_brier":    float(brier_score_loss(y_smoted, proba)),
-            "cv_auroc_mean":  float(cv_scores.mean()),
-            "cv_auroc_std":   float(cv_scores.std()),
+            "horizon":       horizon,
+            "train_auroc":   float(roc_auc_score(y_fit, train_proba)),
+            "cv_auroc_mean": float(cv_scores.mean()),
+            "cv_auroc_std":  float(cv_scores.std()),
+            "use_smote":     use_smote,
+            "n_train":       len(X_fit),
+            "n_calib":       len(X_calib),
+            "pos_rate":      float(y_fit.mean()),
         }
 
         mlflow.log_params({
-            "n_estimators": 300,
-            "max_depth": 5,
-            "learning_rate": 0.05,
+            "horizon": horizon, "use_smote": use_smote,
+            "n_estimators": 400, "max_depth": 6, "learning_rate": 0.04,
         })
-        mlflow.log_metrics(metrics)
+        mlflow.log_metrics({k: v for k, v in metrics.items()
+                            if isinstance(v, float)})
 
-        # Save model
-        import joblib
-        joblib.dump(model,      MODEL_DIR / "xgb_pipeline.pkl")
-        joblib.dump(calibrated, MODEL_DIR / "xgb_calibrated.pkl")
+        # Save artifacts
+        joblib.dump(model,      MODEL_DIR / f"xgb_{horizon}d.pkl")
+        joblib.dump(calibrated, MODEL_DIR / f"xgb_{horizon}d_calibrated.pkl")
 
-    return model, calibrated, shap_values, explainer, metrics
+    return model, calibrated, baseline, shap_values, explainer, metrics
 
 
-# ── Evaluation ────────────────────────────────────────────────────────────────
+# ── Isotonic calibration wrapper ───────────────────────────────────────────────
+
+class _IsotonicWrapper:
+    """
+    Wraps a fitted XGBClassifier + IsotonicRegression into a
+    predict_proba interface compatible with the rest of the pipeline.
+
+    This avoids the CalibratedClassifierCV refitting trap in the
+    original project.
+    """
+    def __init__(self, base_model, iso_regressor):
+        self.base_model = base_model
+        self.iso        = iso_regressor
+
+    def predict_proba(self, X):
+        raw   = self.base_model.predict_proba(X)[:, 1]
+        cal   = self.iso.predict(raw)
+        return np.column_stack([1 - cal, cal])
+
+    def predict(self, X, threshold=0.5):
+        return (self.predict_proba(X)[:, 1] >= threshold).astype(int)
+
+
+# ── Evaluation ─────────────────────────────────────────────────────────────────
 
 def evaluate(
     model,
-    test_df: pd.DataFrame,
+    test_df:  pd.DataFrame,
     features: list[str],
-    threshold: float = 0.5,
+    horizon:  int   = 90,
+    fnr_cost: float = 10.0,
+    fpr_cost: float = 1.0,
 ) -> dict:
-    """Full evaluation on a held-out test set."""
-    X = test_df[features].fillna(0)
-    y = test_df[TARGET]
+    """
+    Full evaluation on a held-out test set.
+
+    Also computes the cost-optimal decision threshold:
+      cost(threshold) = FN_rate * fnr_cost + FP_rate * fpr_cost
+    where fnr_cost = cost of missing a churner (lost customer LTV)
+          fpr_cost = cost of unnecessary retention offer
+
+    Default ratio 10:1 reflects typical telecom economics.
+    """
+    target = _horizon_target(horizon)
+    X, y   = _get_Xy(test_df, features, target)
 
     proba = model.predict_proba(X)[:, 1]
-    pred  = (proba >= threshold).astype(int)
+    pred  = (proba >= 0.5).astype(int)
 
-    fpr, tpr, roc_thresholds = roc_curve(y, proba)
-    prec, rec, pr_thresholds  = precision_recall_curve(y, proba)
+    fpr_arr, tpr_arr, roc_thresh = roc_curve(y, proba)
+    prec_arr, rec_arr, pr_thresh = precision_recall_curve(y, proba)
+
+    # Cost-optimal threshold
+    best_thresh, best_cost = 0.5, np.inf
+    for t in np.linspace(0.1, 0.9, 81):
+        p      = (proba >= t).astype(int)
+        fn_r   = ((p == 0) & (y == 1)).sum() / max((y == 1).sum(), 1)
+        fp_r   = ((p == 1) & (y == 0)).sum() / max((y == 0).sum(), 1)
+        cost   = fn_r * fnr_cost + fp_r * fpr_cost
+        if cost < best_cost:
+            best_cost, best_thresh = cost, t
 
     metrics = {
-        "auroc":          float(roc_auc_score(y, proba)),
-        "auprc":          float(average_precision_score(y, proba)),
-        "brier":          float(brier_score_loss(y, proba)),
-        "fpr":            fpr,
-        "tpr":            tpr,
-        "precision":      prec,
-        "recall":         rec,
-        "y_true":         y.values,
-        "y_score":        proba,
-        "report":         classification_report(y, pred, output_dict=True),
+        "horizon":         horizon,
+        "auroc":           float(roc_auc_score(y, proba)),
+        "auprc":           float(average_precision_score(y, proba)),
+        "brier":           float(brier_score_loss(y, proba)),
+        "f1":              float(f1_score(y, pred)),
+        "fpr":             fpr_arr,
+        "tpr":             tpr_arr,
+        "precision":       prec_arr,
+        "recall":          rec_arr,
+        "y_true":          y.values,
+        "y_score":         proba,
+        "report":          classification_report(y, pred, output_dict=True),
+        "optimal_threshold": best_thresh,
+        "optimal_cost":    best_cost,
     }
     return metrics
 
 
-# ── Cohort scoring ────────────────────────────────────────────────────────────
+def evaluate_baseline(
+    baseline,
+    test_df:  pd.DataFrame,
+    features: list[str],
+    horizon:  int = 90,
+) -> dict:
+    target = _horizon_target(horizon)
+    X, y   = _get_Xy(test_df, features, target)
+    proba  = baseline.predict_proba(X)[:, 1]
+    return {
+        "auroc": float(roc_auc_score(y, proba)),
+        "auprc": float(average_precision_score(y, proba)),
+        "brier": float(brier_score_loss(y, proba)),
+    }
+
+
+# ── Cohort scoring ─────────────────────────────────────────────────────────────
 
 def score_cohorts(
-    model,
-    cohorts: list[pd.DataFrame],
+    model:    object,
+    cohorts:  list[pd.DataFrame],
     features: list[str],
+    horizon:  int = 90,
 ) -> list[pd.DataFrame]:
-    """Return each cohort augmented with 'churn_score' column."""
-    scored = []
+    """Score each cohort and attach churn_score column."""
+    target  = _horizon_target(horizon)
+    scored  = []
     for i, cohort in enumerate(cohorts):
         c = cohort.copy()
         X = c[features].fillna(0)
         c["churn_score"] = model.predict_proba(X)[:, 1]
+        try:
+            auroc = roc_auc_score(c[target], c["churn_score"])
+            print(f"  Cohort {i}: n={len(c):5,} | "
+                  f"churn_rate={c[target].mean():.3f} | "
+                  f"AUROC={auroc:.4f}")
+        except Exception:
+            print(f"  Cohort {i}: n={len(c):5,} | AUROC=N/A")
         scored.append(c)
-        auroc = roc_auc_score(c[TARGET], c["churn_score"])
-        print(f"  Cohort {i}: n={len(c):4d} | churn_rate={c[TARGET].mean():.3f} | AUROC={auroc:.4f}")
     return scored

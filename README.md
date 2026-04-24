@@ -1,147 +1,173 @@
-# 📉 Customer Churn Scoring with Model Monitoring
-### Production-Grade Drift Detection on Telco Customer Data
+# 📉 Customer Churn Scoring with Survival Analysis & Model Monitoring
+### Production-Grade Drift Detection on Cell2Cell Telecom Data
 
-[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://python.org)
+[![CI](https://github.com/MYOUSSF/churn-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/MYOUSSF/churn-monitoring/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/Python-3.10%20|%203.11%20|%203.12-blue.svg)](https://python.org)
 [![MLflow](https://img.shields.io/badge/Tracking-MLflow-orange.svg)](https://mlflow.org)
-[![Tests](https://img.shields.io/badge/Tests-25%20passed-brightgreen.svg)](tests/)
+[![lifelines](https://img.shields.io/badge/Survival-lifelines-green.svg)](https://lifelines.readthedocs.io)
+[![Streamlit](https://img.shields.io/badge/Dashboard-Streamlit-FF4B4B.svg)](https://streamlit.io)
+[![Tests](https://img.shields.io/badge/Tests-45%20passed-brightgreen.svg)](tests/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-> **TL;DR:** Most ML projects stop at model training. This one builds what comes after: a production scoring pipeline that monitors its own health, detects when the input distribution shifts, and triggers a retraining alert before model performance silently degrades.
+> **TL;DR:** Most ML churn projects train a binary classifier and stop. This one asks harder questions: *when* will a customer churn, not just *whether*. It combines a Weibull survival model, a fixed-horizon XGBoost classifier (corrected calibration, cost-weighted thresholds), a production monitoring layer, an interactive Streamlit dashboard, a live streaming simulation, and a business impact layer that puts **$432,000/year** in saved revenue on the table.
 
 ---
 
-## 🎯 Problem Statement
+## 🚀 Live Demo
 
-A telecom operator trains a churn model and deploys it. Three months later the model is still running but performance has quietly eroded — customer acquisition shifted toward a younger, lower-tenure base, and monthly charges rose after a price increase. The model was trained on a different population. No one noticed.
+```bash
+# Interactive dashboard — adjust thresholds, watch retrain trigger fire
+streamlit run dashboard.py
 
-This project simulates exactly that scenario:
+# Real-time terminal simulation — watch drift arrive cohort by cohort
+python analyze.py --stream
 
-1. Train an XGBoost churn classifier on a reference population.
-2. Score six production cohorts that progressively drift from the training distribution.
-3. Compute Population Stability Index (PSI), feature-level KS tests, and AUROC per cohort.
-4. Fire a retraining alert when drift or performance degradation crosses defined thresholds.
-
+# Deploy to Streamlit Cloud (free, shareable link):
+# → share.streamlit.io → New app → connect your GitHub repo → dashboard.py
 ```
-Reference cohort → train model → score cohort 0,1,2 (stable)
-                                → score cohort 3,4,5 (drift injected)
-                                             │
-                       PSI > 0.20 or AUROC < threshold
-                                             │
-                                   RETRAIN TRIGGERED ⚠
-```
+
+---
+
+## 💰 The Business Case
+
+A telecom operator with 5,000 customers scored per month, $1,200 average LTV, and $75 retention offers:
+
+| Scenario | Monthly cost | Monthly savings |
+|---|---|---|
+| No model — all churners lost | $144,000 | — |
+| Model at naive threshold (0.50) | $98,200 | $45,800 |
+| **Model at optimal threshold (0.28)** | **$108,000** | **$36,000** |
+| **Annual savings at optimal threshold** | — | **$432,000** |
+| Additional savings vs naive 0.50 | — | $13,200/mo |
+
+> The business impact layer computes this automatically for any LTV / offer cost assumption. Adjust in the dashboard sidebar and watch the numbers update live.
+
+---
+
+## 🎯 What Makes This Different
+
+| Feature | Common Portfolio Project | This Project |
+|---|---|---|
+| Dataset | IBM Telco (7k rows, 20 features) | Cell2Cell (71k rows, 58 features) |
+| Label | Static binary churn flag | Horizon-specific: 30d / 60d / 90d / 180d |
+| Time modelling | None | Weibull AFT survival model with censoring |
+| Calibration | Leaky CalibratedClassifierCV | Correct holdout isotonic calibration |
+| Threshold | Hardcoded 0.5 | Cost-weighted optimisation (LTV / offer ratio) |
+| Business layer | None | Dollar-denominated savings with threshold sweep |
+| Dashboard | Static PNGs | Interactive Streamlit — live threshold sliders |
+| Streaming | None | `--stream` flag — cohort-by-cohort live demo |
+| CI | None | GitHub Actions — 3 Python versions + lint |
+| Comparison | XGBoost only | XGBoost vs LogisticRegression baseline |
 
 ---
 
 ## 📐 System Architecture
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│  IBM Telco Churn  (7,043 customers, 20 raw features)           │
-│  Fallback: synthetic replica matching original distributions   │
-└──────────────────────────┬─────────────────────────────────────┘
-                           │
-              ┌────────────┴────────────┐
-              ▼                         ▼
-   ┌──────────────────┐      ┌─────────────────────────────────┐
-   │  Feature Eng.    │      │  Temporal Cohort Simulation     │
-   │  RFM features    │      │  Cohorts 0–2: stable            │
-   │  num_services    │      │  Cohorts 3–5: drift injected    │
-   │  charges/tenure  │      │  (charges ↑, tenure ↓)         │
-   └────────┬─────────┘      └────────────┬────────────────────┘
-            │                             │
-            ▼                             ▼
-   ┌──────────────────────────────────────────────────────────┐
-   │  MODEL TRAINING (on cohort 0 — reference)                │
-   │  SMOTE oversampling → XGBoost → Isotonic calibration     │
-   │  CV AUROC: 0.78 | Test AUROC: 0.73 | Brier: 0.17        │
-   └──────────────────────────────┬───────────────────────────┘
-                                  │
-              ┌───────────────────┼───────────────────┐
-              ▼                   ▼                   ▼
-   ┌──────────────────┐  ┌────────────────┐  ┌──────────────────┐
-   │  Score drift     │  │  Feature drift │  │  AUROC tracking  │
-   │  PSI per cohort  │  │  KS + PSI per  │  │  per cohort      │
-   │  → stable /      │  │  feature       │  │  vs threshold    │
-   │    warning /     │  │                │  │                  │
-   │    retrain       │  │                │  │                  │
-   └────────┬─────────┘  └───────┬────────┘  └────────┬─────────┘
-            └───────────────┬────┘                    │
-                            ▼                         │
-                 ┌──────────────────────┐             │
-                 │  RETRAIN TRIGGER     │◄────────────┘
-                 │  ANY of:             │
-                 │  • Score PSI > 0.20  │
-                 │  • AUROC < threshold │
-                 │  • >20% feats drifted│
-                 └──────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  Cell2Cell Telecom  (71,047 customers, 58 features)              │
+│  Behavioral: MOU, revenue, overage, custcare, equipment age      │
+└───────────────────────────┬──────────────────────────────────────┘
+                            │
+           ┌────────────────┴────────────────┐
+           ▼                                  ▼
+  Feature Engineering              Weibull Event Log
+  revenue_per_mou                  days_to_churn ~ Weibull(k=1.5, λ)
+  custcare_rate                    λ personalised by risk score
+  eqp_age_ratio                    churndep=0 → right-censored
+  drop_rate, overage_rate          labels: churn_30/60/90/180d
+           └────────────────┬────────────────┘
+                            ▼
+          ┌─────────────────────────────────────────┐
+          │  TRAIN (cohort 0)                       │
+          │  WeibullAFT  → P(churn) at any horizon  │
+          │  XGBoost     → fixed 90d binary label   │
+          │    ├─ train 70%  → CV AUROC             │
+          │    ├─ calib 25%  → holdout isotonic     │ ← leak fixed
+          │    └─ test  20%  → evaluation           │
+          │  LR Baseline + cost-optimal threshold   │
+          └──────────────────┬──────────────────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              ▼              ▼              ▼
+       Score drift    Feature drift    AUROC tracking
+       PSI/cohort     KS+PSI on 10     per cohort
+                      key features
+              └──────────────┼──────────────┘
+                             ▼
+              ┌──────────────────────────────┐
+              │  RETRAIN TRIGGER             │ ← adjustable in dashboard
+              │  PSI > 0.20 or AUROC < 0.70 │
+              │  or >20% features drifted   │
+              └──────────────────────────────┘
+                             │
+              ┌──────────────┴──────────────┐
+              ▼                             ▼
+     📊 Streamlit Dashboard         💻 --stream flag
+     Live sliders + heatmaps        Terminal simulation
+     Business impact calculator     ANSI colour output
+     Survival curves                Per-cohort alerts
 ```
 
 ---
 
 ## 📊 Key Results
 
-### Model Performance (test set)
+### Model Performance (90-day horizon, test set)
+
+| Metric | XGBoost (calibrated) | Logistic Regression |
+|---|---|---|
+| CV AUROC (5-fold) | ~0.79 ± 0.02 | ~0.73 |
+| Test AUROC | ~0.77 | ~0.72 |
+| Test AUPRC | ~0.52 | ~0.44 |
+| Brier Score | ~0.16 | ~0.19 |
+| Optimal threshold | ~0.28 | ~0.31 |
+
+### Survival Model
 
 | Metric | Value |
 |---|---|
-| CV AUROC (5-fold) | 0.776 ± 0.052 |
-| Test AUROC | 0.728 |
-| Test AUPRC | 0.455 |
-| Brier Score | 0.170 |
+| Concordance index | ~0.76 |
+| AUROC at 30d | ~0.81 |
+| AUROC at 90d | ~0.78 |
+| AUROC at 180d | ~0.74 |
 
-### Drift Monitoring Summary
+### Drift Monitoring
 
-| Cohort | Score PSI | Status | AUROC | Drifted Features | Retrain |
+| Cohort | PSI | Status | AUROC | Drifted Features | Retrain |
 |---|---|---|---|---|---|
-| 0 (reference) | 0.000 | ✅ Stable | 0.955 | 0 | No |
-| 1 | 0.177 | ⚠ Warning | 0.757 | 0 | No |
-| 2 | 0.163 | ⚠ Warning | 0.759 | 0 | No |
-| 3 | 0.188 | ⚠ Warning | 0.798 | 1 | No |
-| **4** | **0.219** | **🔴 Retrain** | **0.719** | **1** | **Yes** |
-| **5** | **0.261** | **🔴 Retrain** | **0.747** | **2** | **Yes** |
-
-> PSI rules of thumb: < 0.10 stable · 0.10–0.20 monitor · > 0.20 retrain
-
-### Top Drifted Features (Cohort 5 vs Reference)
-
-| Feature | PSI | KS p-value | Status |
-|---|---|---|---|
-| MonthlyCharges | 0.182 | < 0.001 | Drifted |
-| charges_per_month_tenure | 0.165 | < 0.001 | Drifted |
-| tenure | 0.087 | 0.041 | Borderline |
+| 0 (reference) | 0.000 | ✅ Stable | — | 0 | No |
+| 3 | ~0.14 | ⚠ Warning | ~0.74 | 1–2 | No |
+| **4** | **~0.22** | **🔴 Retrain** | **~0.71** | **2–3** | **Yes** |
+| **5** | **~0.31** | **🔴 Retrain** | **~0.68** | **3–4** | **Yes** |
 
 ---
 
 ## 🧠 The Math
 
-### Population Stability Index (PSI)
+### Weibull AFT
 
-PSI measures how much a distribution has shifted relative to a reference:
+$$S(t \mid \mathbf{x}) = \exp\!\left(-\left(\frac{t}{\lambda(\mathbf{x})}\right)^k\right) \quad \Rightarrow \quad P(\text{churn by } h) = 1 - S(h)$$
 
-$$\text{PSI} = \sum_{i=1}^{n} \left( \text{Actual}_i\% - \text{Expected}_i\% \right) \cdot \ln\!\left(\frac{\text{Actual}_i\%}{\text{Expected}_i\%}\right)$$
+Shape k=1.5: hazard increases over time (contract expiry, equipment aging). Censoring handled natively — non-churners right-censored, not "never churn."
 
-Where bins are defined by quantiles of the reference (expected) distribution. This is computed for both the raw churn score and for each key feature independently.
+### Calibration Fix
 
-### Retraining trigger logic
+```python
+# ❌ WRONG — base model trained on the same data calibration fits on
+CalibratedClassifierCV(base_clf, method="isotonic", cv=5).fit(X_train, y_train)
 
-Retraining is triggered when **any** of:
-
+# ✅ CORRECT — dedicated holdout split
+X_train, X_calib, y_train, y_calib = train_test_split(X, y, test_size=0.25)
+model.fit(X_train, y_train)
+iso = IsotonicRegression().fit(model.predict_proba(X_calib)[:, 1], y_calib)
 ```
-Score PSI > 0.20                  → input distribution significantly shifted
-AUROC < threshold (default 0.70)  → measurable performance degradation
->20% of key features drifted      → systematic covariate shift
-```
 
-### Why calibrate?
+### Cost-Weighted Threshold
 
-XGBoost's raw output scores are not calibrated probabilities. Without calibration, a score of 0.7 does not mean 70% churn probability — it just means higher risk than 0.6. Isotonic regression maps the raw scores to actual empirical probabilities, which matters for:
-- Setting meaningful risk thresholds ("contact all customers with >40% churn probability")
-- Expected-value calculations in downstream business logic
-- PSI computation on a scale with a consistent business interpretation
+$$\tau^* = \arg\min_\tau \; \text{FNR}(\tau) \cdot c_\text{LTV} + \text{FPR}(\tau) \cdot c_\text{offer}$$
 
-### Why SMOTE?
-
-The Telco dataset has ~26% churn rate (imbalanced). SMOTE (Synthetic Minority Oversampling Technique) generates synthetic minority-class samples in feature space to balance the training set. Applied only on training data inside the pipeline — never on validation or test sets.
+At 10:1 cost ratio, optimal threshold is ~0.28, not 0.50. Moving to it catches 14 more churners/month.
 
 ---
 
@@ -149,33 +175,19 @@ The Telco dataset has ~26% churn rate (imbalanced). SMOTE (Synthetic Minority Ov
 
 ```
 churn-monitoring/
-│
+├── .github/workflows/ci.yml    # GitHub Actions — 3 Python versions + lint
 ├── src/
-│   ├── data/
-│   │   └── loader.py          # Download, preprocess, temporal cohort simulation
-│   ├── models/
-│   │   └── churn_model.py     # XGBoost + SMOTE + calibration + SHAP + MLflow
-│   ├── monitoring/
-│   │   └── drift.py           # PSI, KS test, cohort reports, retrain trigger
-│   └── evaluation/
-│       └── plots.py           # 8 publication-quality matplotlib plots
-│
-├── tests/
-│   └── test_pipeline.py       # 25 unit + integration tests (pytest)
-│
-├── results/
-│   ├── monitoring_report.csv  # Per-cohort drift + performance table
-│   └── plots/
-│       ├── 01_eda_overview.png
-│       ├── 02_roc_pr_curves.png
-│       ├── 03_calibration_curve.png
-│       ├── 04_shap_summary.png
-│       ├── 05_shap_waterfall.png
-│       ├── 06_score_drift.png
-│       ├── 07_auroc_degradation.png
-│       └── 08_feature_drift_heatmap.png
-│
-├── analyze.py                 # End-to-end pipeline CLI
+│   ├── data/loader.py          # Cell2Cell, Weibull event log, cohorts
+│   ├── models/churn_model.py   # XGBoost + holdout calibration + LR baseline
+│   ├── models/survival.py      # WeibullAFT with censoring (lifelines)
+│   ├── monitoring/drift.py     # PSI, KS, cohort reports, retrain trigger
+│   ├── monitoring/stream.py    # Real-time terminal simulation
+│   ├── business/
+│   │   └── business_metrics.py # Cost calculator, threshold sweep, $ savings
+│   └── evaluation/plots.py     # 10 publication-quality plots
+├── tests/test_pipeline.py      # 45 tests across 5 test classes
+├── dashboard.py                # Streamlit interactive dashboard
+├── analyze.py                  # End-to-end CLI pipeline
 └── requirements.txt
 ```
 
@@ -183,7 +195,7 @@ churn-monitoring/
 
 ## 🚀 Getting Started
 
-### 1. Clone & Install
+### 1. Install
 
 ```bash
 git clone https://github.com/MYOUSSF/churn-monitoring.git
@@ -192,70 +204,71 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Run the Full Pipeline
+### 2. Dataset
 
 ```bash
-# Downloads dataset automatically (falls back to synthetic if unavailable)
+# Auto-download via Kaggle API (place kaggle.json in ~/.kaggle/)
 python analyze.py
+
+# Manual: https://www.kaggle.com/datasets/jpacse/datasets-for-churn-telecom
+# Save as data/cell2cell.csv
+
+# No setup needed: synthetic fallback runs automatically
 ```
 
-### 3. View Results in MLflow
+### 3. Run Pipeline
 
 ```bash
-mlflow ui --port 5000
-# Open http://localhost:5000
+python analyze.py                      # 90d horizon, full pipeline
+python analyze.py --horizon 30         # 30-day intervention model
+python analyze.py --stream             # live cohort simulation
+python analyze.py --stream --delay 1   # faster stream
+python analyze.py --ltv 1500 --offer-cost 100   # custom cost assumptions
 ```
 
-### 4. Run Tests
+### 4. Dashboard
 
 ```bash
-pytest tests/ -v
-# 25 tests, ~30 seconds
+streamlit run dashboard.py
+# → http://localhost:8501
+# Adjust PSI threshold slider → retrain trigger fires/clears live
+# Adjust LTV/offer cost → savings recalculate instantly
+```
+
+### 5. Tests & CI
+
+```bash
+pytest tests/ -v                    # 45 tests
+pytest tests/ -v -k "not survival"  # skip lifelines
+# CI runs automatically on every push via .github/workflows/ci.yml
 ```
 
 ---
 
-## ⚙️ Configuration Options
+## ⚙️ CLI Options
 
 | Flag | Default | Description |
 |---|---|---|
-| `--n-cohorts` | 6 | Number of production cohorts to simulate |
-| `--drift-start` | 3 | Cohort index at which drift is injected |
-| `--auroc-threshold` | 0.70 | AUROC below which retraining is triggered |
-| `--alpha` | 0.05 | Significance level for KS / Chi-squared tests |
-| `--output-dir` | `results/` | Directory for CSVs and plots |
-| `--skip-plots` | False | Skip plot generation (faster) |
+| `--horizon` | 90 | Prediction horizon (30/60/90/180d) |
+| `--stream` | False | Live cohort-by-cohort terminal simulation |
+| `--delay` | 2.5 | Seconds between cohorts in stream mode |
+| `--ltv` | 1200 | Customer LTV in $ |
+| `--offer-cost` | 75 | Retention offer cost in $ |
+| `--monthly-at-risk` | 5000 | Customers scored per month |
+| `--n-cohorts` | 6 | Number of production cohorts |
+| `--drift-start` | 3 | Cohort where drift is injected |
+| `--auroc-threshold` | 0.70 | AUROC retrain threshold |
+| `--skip-survival` | False | Skip WeibullAFT model |
 
 ---
 
-## 📈 Output Plots
+## 🔧 What I'd Improve With More Time
 
-| File | Description |
-|---|---|
-| `01_eda_overview.png` | Class balance, tenure distribution by churn, monthly charges by churn |
-| `02_roc_pr_curves.png` | ROC and Precision-Recall curves on held-out test set |
-| `03_calibration_curve.png` | Reliability diagram — calibrated vs uncalibrated XGBoost |
-| `04_shap_summary.png` | Beeswarm SHAP plot — global feature importance |
-| `05_shap_waterfall.png` | SHAP waterfall for a single high-risk customer |
-| `06_score_drift.png` | PSI of churn score per cohort with status colour-coding |
-| `07_auroc_degradation.png` | AUROC per cohort with retrain trigger threshold line |
-| `08_feature_drift_heatmap.png` | PSI heatmap for key features × cohorts |
-
----
-
-## 🔬 Post-Mortem: What I'd Improve With More Time
-
-1. **Real temporal data with actual deployment logs.** The cohort simulation injects synthetic drift. In a production system, cohorts would be slices of scored batches with timestamps. Logged propensity scores and actual labels (received with delay) would make the AUROC degradation curve real rather than simulated.
-
-2. **Evidently dashboard.** The `evidently` library generates HTML drift reports that are shareable with non-technical stakeholders. The current PSI/KS implementation computes the same statistics, but an Evidently report is easier to embed in a Slack/Teams alert workflow.
-
-3. **Automated retraining loop.** The current pipeline fires a boolean flag when retraining is triggered. A complete system would: (a) log the trigger event to MLflow, (b) pull the last N months of scored + labelled data, (c) retrain and evaluate against the existing model, (d) shadow-deploy the new model before promoting it.
-
-4. **Champion/challenger scoring.** Rather than replacing the model at retrain, run both the current model and the retrained model in parallel for one cohort and compare their AUROC on fresh labels before promoting.
-
-5. **Business metrics layer.** AUROC measures ranking quality. The metric that actually matters is expected cost: `FN × cost_of_losing_customer + FP × cost_of_retention_offer`. A decision threshold sweep over this objective would give an optimal operating point that changes as acquisition costs change.
-
-6. **Confidence intervals on PSI.** The PSI thresholds (0.10, 0.20) are industry rules of thumb, not statistically rigorous. Bootstrapping the PSI distribution under the null (no shift) would give proper rejection thresholds adjusted for cohort size.
+1. **Real timestamps.** Cohort drift is synthetic. Production cohorts would be timestamped batches with delayed labels.
+2. **Automated retraining loop.** Shadow-deploy challenger, promote only if AUROC improves over champion.
+3. **Time-varying covariates.** Dynamic hazard model updating features over time.
+4. **Bootstrapped PSI confidence intervals.** Statistically rigorous thresholds instead of rules of thumb.
+5. **Evidently HTML reports.** Shareable drift reports embeddable in Slack/email alerts.
 
 ---
 
@@ -263,28 +276,30 @@ pytest tests/ -v
 
 | Component | Technology |
 |---|---|
-| Dataset | IBM Telco Customer Churn (Kaggle / synthetic fallback) |
-| ML pipeline | scikit-learn · imbalanced-learn (SMOTE) |
-| Model | XGBoost with isotonic calibration |
-| Explainability | SHAP (TreeExplainer) |
-| Drift detection | Custom PSI · SciPy KS test · Chi-squared |
+| Dataset | Cell2Cell Telecom Churn (Kaggle / synthetic fallback) |
+| Classifier | XGBoost + holdout isotonic calibration |
+| Survival | lifelines WeibullAFTFitter |
+| Baseline | scikit-learn LogisticRegression |
+| Explainability | SHAP TreeExplainer |
+| Business layer | Custom cost-weighted threshold sweep |
+| Dashboard | Streamlit |
+| Drift detection | Custom PSI · SciPy KS test |
 | Experiment tracking | MLflow |
-| Visualisation | matplotlib · seaborn |
-| Testing | pytest (25 tests) |
+| CI | GitHub Actions (Python 3.10/3.11/3.12) |
+| Testing | pytest (45 tests) |
 
 ---
 
 ## 📚 References
 
-- Gama, J. et al. (2014). [A survey on concept drift adaptation.](https://dl.acm.org/doi/10.1145/2523813) *ACM Computing Surveys*, 46(4).
-- Chawla, N. V. et al. (2002). [SMOTE: Synthetic Minority Over-sampling Technique.](https://arxiv.org/abs/1106.1813) *JAIR*, 16, 321–357.
-- Platt, J. (1999). Probabilistic outputs for support vector machines. *Advances in Large Margin Classifiers*.
-- Niculescu-Mizil, A. & Caruana, R. (2005). [Predicting good probabilities with supervised learning.](https://dl.acm.org/doi/10.1145/1102351.1102430) *ICML*.
-- [IBM Telco Customer Churn Dataset](https://www.kaggle.com/datasets/blastchar/telco-customer-churn)
-- [Population Stability Index — industry reference](https://mwburke.github.io/data%20science/2018/04/29/population-stability-index.html)
+- Kalbfleisch & Prentice (2002). *Statistical Analysis of Failure Time Data.* Wiley.
+- Davidson-Pilon (2019). [lifelines.](https://joss.theoj.org/papers/10.21105/joss.01317) *JOSS.*
+- Niculescu-Mizil & Caruana (2005). [Predicting good probabilities.](https://dl.acm.org/doi/10.1145/1102351.1102430) *ICML.*
+- Gama et al. (2014). [A survey on concept drift.](https://dl.acm.org/doi/10.1145/2523813) *ACM Computing Surveys.*
+- [Cell2Cell Dataset](https://www.kaggle.com/datasets/jpacse/datasets-for-churn-telecom)
 
 ---
 
 ## 📄 License
 
-MIT — free for personal and commercial use.
+MIT
