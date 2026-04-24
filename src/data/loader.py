@@ -28,7 +28,7 @@ RAW_PATH = DATA_DIR / "cell2cell.csv"
 # Kaggle dataset slug
 KAGGLE_DATASET = "jpacse/datasets-for-churn-telecom"
 
-TARGET = "churn"
+TARGET = "churndep"
 HORIZONS = [30, 60, 90, 180]
 
 # ── Feature groups ─────────────────────────────────────────────────────────────
@@ -217,7 +217,6 @@ def _generate_synthetic(n: int = 71047, seed: int = 42) -> pd.DataFrame:
         "dropblk":      rng.poisson(3, n),
         "callfwdv":     rng.poisson(0.2, n),
         "callwait":     rng.poisson(1, n),
-        "churn":        churndep,
         "eqpdays":      eqpdays,
         "age1":         age1,
         "age2":         rng.integers(18, 80, size=n),
@@ -271,11 +270,15 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     # ── Normalise real Cell2Cell column names → internal names ────────────────
     # The published dataset uses CamelCase long names; map them to the short
     # names the rest of the pipeline expects.
+    # Exact mapping from the real Cell2Cell column names (lowercase after .str.lower())
+    # to the internal short names used throughout the pipeline.
     RENAME = {
+        # Target — the dataset uses "churn", not "churndep" or "churnlabel"
+        "churn":                    "churndep",
+        # Also handle other common variants just in case
         "churnlabel":               "churndep",
-        "monthsinservice":          "months",
-        "uniquesubs":               "uniqsubs",
-        "activesubs":               "actvsubs",
+        "churndep":                 "churndep",   # already correct, no-op
+        # Usage / billing
         "monthlyrevenue":           "revenue",
         "monthlyminutes":           "mou",
         "totalrecurringcharge":     "recchrge",
@@ -284,9 +287,14 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
         "roamingcalls":             "roam",
         "percchangeminutes":        "changem",
         "percchangerevenues":       "changer",
+        # Call quality
         "droppedcalls":             "dropvce",
         "blockedcalls":             "blckvce",
         "unansweredcalls":          "unansvce",
+        "droppedblockedcalls":      "dropblk",
+        "callforwardingcalls":      "callfwdv",
+        "callwaitingcalls":         "callwait",
+        # Customer interactions
         "customercarecalls":        "custcare",
         "threewaycalls":            "threeway",
         "receivedcalls":            "mourec",
@@ -294,48 +302,51 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
         "inboundcalls":             "incalls",
         "peakcallsinout":           "peakvce",
         "offpeakcallsinout":        "offpeakvce",
-        "droppedblockedcalls":      "dropblk",
-        "callforwardingcalls":      "callfwdv",
-        "callwaitingcalls":         "callwait",
+        "retentioncalls":           "retcalls",
+        "retentionoffersaccepted":  "retaccpt",
+        "madecalltoretentionteam":  "madecall",
+        # Account / tenure
+        "monthsinservice":          "months",
+        "uniquesubs":               "uniqsubs",
+        "activesubs":               "actvsubs",
         "currentequipmentdays":     "eqpdays",
-        "agehh1":                   "age1",
-        "agehh2":                   "age2",
+        # Equipment
         "handsets":                 "phones",
         "handsetmodels":            "models",
         "handsetprice":             "hnd_price",
         "handsetrefurbished":       "refurb_new",
         "handsetwebcapable":        "webcap",
+        # Demographics
+        "agehh1":                   "age1",
+        "agehh2":                   "age2",
+        "childreninhh":             "kid0_2",
+        "incomegroup":              "income",
         "truckowner":               "truck",
         "rvowner":                  "rv",
         "homeownership":            "ownrent",
-        "retentioncalls":           "retcalls",
-        "retentionoffersaccepted":  "retaccpt",
-        "newcellphoneuser":         "newcelly",
-        "notnewcellphoneuser":      "newcelln",
-        "referralsmadebysubscriber":"numbcars",   # closest proxy
-        "incomegroup":              "income",
-        "ownscomputer":             "pcown",
-        "hascreditcard":            "creditcd",
         "buysviamailorder":         "mailorder",
-        "respondstomail offers":    "mailres",
         "respondstomailoffers":     "mailres",
         "optoutmailings":           "mailord",
         "nonustravel":              "forgntvl",
-        "ownsMotorcycle":           "mtrcycle",
+        "ownscomputer":             "pcown",
+        "hascreditcard":            "creditcd",
+        "newcellphoneuser":         "newcelly",
+        "notnewcellphoneuser":      "newcelln",
+        "referralsmadebysubscriber":"refs",
         "ownsmotorcycle":           "mtrcycle",
-        "adjustmentstocreditrating":"creditrating",
-        "madecalltoretentionteam":  "madecall",
+        "adjustmentstocreditrating":"adj_credit",
+        # Categoricals
         "creditrating":             "crclscod",
         "prizmcode":                "prizm_social_one",
         "occupation":               "occup",
         "maritalstatus":            "marital",
         "servicearea":              "area",
-        "childreninh h":            "kid0_2",
-        "childreninhh":             "kid0_2",
-        "numberof references":      "lor",
-        "numberofreferences":       "lor",
     }
     df = df.rename(columns={k: v for k, v in RENAME.items() if k in df.columns})
+
+    # Drop any duplicate columns that arise when both "churn" and "churndep"
+    # exist (synthetic data) or if the rename created a collision
+    df = df.loc[:, ~df.columns.duplicated(keep="first")]
 
     # Drop identifier
     df = df.drop(columns=["customerid"], errors="ignore")
@@ -354,44 +365,117 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
 
     # Encode binary flags
     for col in ["asl_flag", "refurb_new", "creditcd", "mailorder",
-                "webcap", "truck", "rv", "ownrent", "forgntvl",
-                "kid0_2", "mailres", "mailord", "pcown",
-                "newcelly", "newcelln", "mtrcycle", "madecall"]:
-        if col in df.columns and df[col].dtype == object:
-            pos = df[col].mode()[0]
-            df[col] = (df[col] == pos).astype(int)
+                "webcap", "truck", "rv", "ownrent", "forgntvl"]:
+        if col in df.columns:
+            if df[col].dtype == object:
+                pos = df[col].mode()[0]
+                df[col] = (df[col] == pos).astype(int)
 
-    # One-hot encode categoricals that remain
-    cat_cols = [c for c in ["crclscod", "area", "hnd_webcap", "marital",
-                             "creditcd", "occup", "dwlltype", "ethnic",
-                             "refurb_new", "prizm_social_one"]
-                if c in df.columns and df[c].dtype == object]
-    if cat_cols:
-        df = pd.get_dummies(df, columns=cat_cols, drop_first=False)
+    # Encode categoricals — carefully to avoid OHE explosion.
+    # High-cardinality columns (area, prizm codes) are label-encoded,
+    # not one-hot encoded, to prevent 826-feature disasters.
+    HIGH_CARD = ["area", "prizm_social_one", "crclscod", "servicearea"]
+    LOW_CARD  = ["hnd_webcap", "marital", "occup", "dwlltype",
+                 "ethnic", "refurb_new", "creditcd"]
+
+    # Label-encode high-cardinality columns
+    for col in HIGH_CARD:
+        if col in df.columns and df[col].dtype == object:
+            df[col] = pd.Categorical(df[col]).codes.astype(int)
+
+    # One-hot only low-cardinality columns (max ~5 unique values each)
+    ohe_cols = [c for c in LOW_CARD
+                if c in df.columns and df[c].dtype == object
+                and df[c].nunique() <= 8]
+    if ohe_cols:
+        df = pd.get_dummies(df, columns=ohe_cols, drop_first=True)
+
+    # Drop any remaining object columns that slipped through
+    # Exclude TARGET — it may still be a string ("Yes"/"No") at this point
+    remaining_obj = [c for c in df.select_dtypes(include="object").columns
+                     if c != TARGET]
+    if remaining_obj:
+        df = df.drop(columns=remaining_obj)
 
     # ── Feature engineering ───────────────────────────────────────
-    # Revenue efficiency: how much revenue per minute of use
+
+    # Revenue efficiency
     df["revenue_per_mou"] = df["revenue"] / (df["mou"] + 1)
 
     # Call quality: drop rate as fraction of total voice
-    total_voice = df.get("peakvce", 0) + df.get("offpeakvce", 0) + 1
+    total_voice = (df.get("peakvce",    pd.Series(0, index=df.index))
+                 + df.get("offpeakvce", pd.Series(0, index=df.index)) + 1)
     df["drop_rate"] = df.get("dropvce", pd.Series(0, index=df.index)) / total_voice
 
-    # Customer care intensity: calls per month of tenure
+    # Customer care intensity
     df["custcare_rate"] = df["custcare"] / (df["months"] + 1)
 
-    # Equipment age relative to tenure (equipment older than tenure = upgrade lag)
+    # Equipment age relative to tenure
     df["eqp_age_ratio"] = df["eqpdays"] / (df["months"] * 30 + 1)
 
-    # Usage trend: change in MOU normalized by current MOU
+    # Usage trend
     if "changem" in df.columns:
         df["mou_trend"] = df["changem"] / (df["mou"] + 1)
 
-    # Overage intensity: overage as fraction of base charge
+    # Overage intensity
     if "recchrge" in df.columns:
         df["overage_rate"] = df["overage"] / (df["recchrge"] + 1)
 
-    # Ensure target is int — real dataset uses "Yes"/"No" or 1/0
+    # ── Cell2Cell-specific strong signals ─────────────────────────
+    # Retention contact — customers who called the retention team or
+    # received offers are at demonstrated risk; accept-rate signals intent
+    if "retcalls" in df.columns:
+        df["retention_contact"] = (df["retcalls"] > 0).astype(int)
+    if "retcalls" in df.columns and "retaccpt" in df.columns:
+        df["retention_accept_rate"] = (
+            df["retaccpt"] / (df["retcalls"] + 1)
+        )
+    if "madecall" in df.columns:
+        df["made_retention_call"] = df["madecall"].astype(int)
+
+    # Inbound vs outbound ratio — customers who stop calling out
+    # but still receive inbound calls may be passively churning
+    if "outcalls" in df.columns and "incalls" in df.columns:
+        df["outbound_ratio"] = df["outcalls"] / (df["incalls"] + 1)
+
+    # Unanswered call rate — proxy for disengagement
+    if "unansvce" in df.columns:
+        total_calls = (df.get("peakvce",    pd.Series(0, index=df.index))
+                     + df.get("offpeakvce", pd.Series(0, index=df.index)) + 1)
+        df["unanswered_rate"] = df["unansvce"] / total_calls
+
+    # Revenue change momentum — consistent decline is a churn signal
+    if "changer" in df.columns:
+        df["revenue_declining"] = (df["changer"] < 0).astype(int)
+        df["revenue_change_mag"] = df["changer"].abs()
+
+    # Credit adjustment flag — risk indicator
+    if "adj_credit" in df.columns:
+        df["has_credit_adjustment"] = (df["adj_credit"] != 0).astype(int)
+
+    # Replace any inf / -inf values produced by division with large-but-finite
+    # values, then fill any remaining NaNs with column medians.
+    # This prevents sklearn's finite-value checks from failing on test data.
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    df[num_cols] = df[num_cols].replace([np.inf, -np.inf], np.nan)
+    for col in num_cols:
+        if df[col].isna().any():
+            df[col] = df[col].fillna(df[col].median())
+
+    # Ensure target column exists — "Churn" → "churndep" via rename above
+    # but guard against edge cases where the rename dict missed a variant
+    if TARGET not in df.columns:
+        for candidate in ["churn", "churnlabel", "churndep", "Churn"]:
+            if candidate in df.columns:
+                df = df.rename(columns={candidate: TARGET})
+                break
+        else:
+            raise KeyError(
+                f"Could not find target column. Expected '{TARGET}' or 'Churn'. "
+                f"Columns present: {list(df.columns[:10])}"
+            )
+
+    # Encode target as int — real dataset uses "Yes"/"No" strings
     if df[TARGET].dtype == object:
         df[TARGET] = df[TARGET].str.strip().str.lower().map(
             {"yes": 1, "true": 1, "1": 1, "no": 0, "false": 0, "0": 0}
@@ -457,20 +541,34 @@ def generate_weibull_event_log(
     def _pct(s, q):
         return (s > s.quantile(q)).astype(float)
 
-    risk = (
-        0.25 * (df["months"] < 6).astype(float)          # new = risky
-      + 0.15 * (df["months"] < 12).astype(float)
-      + 0.20 * _pct(df["revenue"], 0.75)                  # high billing
-      + 0.15 * _pct(df["eqpdays"], 0.75)                  # old equipment
-      + 0.10 * (df["mou"] < df["mou"].quantile(0.25)).astype(float)   # low usage
-      + 0.10 * _pct(df["custcare"], 0.75)                 # frequent support
-      + 0.05 * df[TARGET].astype(float)                   # anchor to label
-    ).clip(0.05, 0.95)
+    # The churndep label is the sole driver of which side of the horizon
+    # a customer falls on. Feature-based variation is added as pure noise
+    # within each class so the model cannot reverse-engineer the label from
+    # the features used to build the risk score.
+    #
+    # Specifically: eqpdays and months are EXCLUDED from feature_risk because
+    # they appear in the feature set and would create a deterministic path
+    # churndep → days_to_churn → churn_90d that the model memorises perfectly,
+    # causing train AUROC ~0.95 while CV AUROC stays ~0.62.
+    churned     = df[TARGET].astype(float)
+    not_churned = 1.0 - churned
+
+    # Within-class variation from features NOT in the key feature set,
+    # plus uniform random noise — prevents memorisation
+    custcare_signal = _pct(df["custcare"], 0.75) if "custcare" in df.columns else 0.0
+    noise           = pd.Series(rng.uniform(0, 1, len(df)), index=df.index)
+    feature_risk    = (0.15 * custcare_signal + 0.35 * noise).clip(0.0, 0.50)
+
+    # Known churners: lifetime in [short, medium]; non-churners: [medium, long]
+    # Separation is driven by the label, not by feature values
+    risk = (churned     * (0.75 + 0.20 * feature_risk)
+            + not_churned * (0.05 + 0.25 * feature_risk)
+            ).clip(0.05, 0.95)
 
     # ── Weibull sampling via inverse CDF ──────────────────────────
     # T = scale * (-ln(U))^(1/k),  U ~ Uniform(0,1)
-    # scale personalised: high risk → small scale → short lifetime
-    scale = max_days * (1.0 - 0.75 * risk)
+    # scale: high risk → small scale → short lifetime
+    scale = max_days * 0.45 * (1.0 - 0.72 * risk)
     u     = rng.uniform(1e-6, 1 - 1e-6, size=len(df))
     days_to_churn = scale * (-np.log(u)) ** (1.0 / shape)
     days_to_churn = days_to_churn.clip(1, max_days * 2).round().astype(int)
@@ -596,10 +694,24 @@ def load_pipeline(
                                      drift_start=drift_start)
     features = get_feature_cols(cohorts[0])
 
-    # Train/test split from cohort 0
-    base  = cohorts[0]
-    split = int(0.8 * len(base))
-    train_df = base.iloc[:split].copy()
-    test_df  = base.iloc[split:].copy()
+    # Train on the FULL dataset (proper 80/20 stratified split).
+    # Cohort 0 alone is only ~1.7% of the data — training on 960 rows
+    # from a 71k dataset wastes 98% of the signal.
+    # Cohorts are drawn from the same full pool for monitoring purposes.
+    from sklearn.model_selection import train_test_split as _tts
+    target_col = f"churn_{horizon}d"
+    train_df, test_df = _tts(
+        processed,
+        test_size=0.20,
+        stratify=processed[target_col],
+        random_state=42,
+    )
+    train_df = train_df.copy()
+    test_df  = test_df.copy()
+
+    print(f"  Training set : {len(train_df):,} rows | "
+          f"churn rate: {train_df[target_col].mean():.1%}")
+    print(f"  Test set     : {len(test_df):,} rows  | "
+          f"churn rate: {test_df[target_col].mean():.1%}")
 
     return train_df, test_df, cohorts, features, horizon

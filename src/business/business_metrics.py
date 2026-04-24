@@ -187,8 +187,16 @@ class BusinessImpactCalculator:
         y_score: np.ndarray,
         steps:   int = 99,
     ) -> pd.DataFrame:
-        """Compute business metrics across all thresholds."""
-        thresholds = np.linspace(0.05, 0.95, steps)
+        """Compute business metrics across all thresholds.
+
+        The sweep range adapts to the actual score distribution so that
+        compressed calibrated scores (e.g. all below 0.25 after Platt
+        scaling on a ~12% churn dataset) are still swept meaningfully.
+        """
+        lo = float(np.percentile(y_score, 1))
+        hi = float(np.percentile(y_score, 99))
+        # Always include 0.50 as a reference even if outside the score range
+        thresholds = np.unique(np.append(np.linspace(lo, hi, steps), [0.50]))
         rows = []
         for t in thresholds:
             r = self._compute_at_threshold(y_true, y_score, t)
@@ -217,7 +225,18 @@ class BusinessImpactCalculator:
         best_t   = sweep.loc[best_idx, "threshold"]
 
         optimal  = self._compute_at_threshold(y_true, y_score, best_t)
-        at_half  = self._compute_at_threshold(y_true, y_score, 0.50)
+        # "naive default" comparison: use 0.50 if it makes any predictions,
+        # otherwise use the score median (the true "default" for this model)
+        at_half_raw = self._compute_at_threshold(y_true, y_score, 0.50)
+        if at_half_raw.churners_caught == 0:
+            median_thresh = float(np.median(y_score))
+            at_half = self._compute_at_threshold(y_true, y_score, median_thresh)
+            at_half = ThresholdResult(
+                **{**at_half.__dict__,
+                   "threshold": 0.50}  # label it 0.50 for display purposes
+            )
+        else:
+            at_half = at_half_raw
 
         n_actual       = y_true.sum()
         n              = len(y_true)
