@@ -9,7 +9,7 @@
 [![Tests](https://img.shields.io/badge/Tests-45%20passed-brightgreen.svg)](tests/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-> **TL;DR:** Most ML churn projects stop at model training. This one builds what comes after — a production scoring pipeline that asks *when* a customer will churn, not just *whether*, monitors its own health across cohorts, detects distribution shift before performance silently degrades, and translates model outputs into dollar-denominated business decisions. Deployable live at [share.streamlit.io](https://share.streamlit.io).
+> **TL;DR:** Most ML churn projects stop at model training. This one builds what comes after — a production scoring pipeline that asks *when* a customer will churn, not just *whether*, monitors its own health across cohorts, detects distribution shift before performance silently degrades, and translates model outputs into dollar-denominated business decisions. Deployable live at [churn-monitoring.streamlit](https://churn-monitoring.streamlit.app).
 
 ---
 
