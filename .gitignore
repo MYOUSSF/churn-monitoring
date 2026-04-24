@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.env/
+.env
+.env.*
+
+# IDE/editor files
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# OS files
+.DS_Store
+
+# Data and database files
+*.db
+*.sqlite3
+*.csv
+*.tsv
+*.xlsx
+
+# Model artifacts / outputs
+models/
+results/
+mlruns/
+
+# Logs
+*.log
+
+# Jupyter
+.ipynb_checkpoints/

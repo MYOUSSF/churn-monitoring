@@ -28,7 +28,7 @@ RAW_PATH = DATA_DIR / "cell2cell.csv"
 # Kaggle dataset slug
 KAGGLE_DATASET = "jpacse/datasets-for-churn-telecom"
 
-TARGET = "churndep"
+TARGET = "churn"
 HORIZONS = [30, 60, 90, 180]
 
 # ── Feature groups ─────────────────────────────────────────────────────────────
@@ -113,7 +113,14 @@ CATEGORICAL_COLS = [
 def download_data(force: bool = False) -> pd.DataFrame:
     """
     Try to load Cell2Cell from disk, then Kaggle, then fall back to synthetic.
+    Checks both data/cell2celltrain.csv (user-provided) and data/cell2cell.csv.
     """
+    # Check user-provided filename first
+    alt = DATA_DIR / "cell2celltrain.csv"
+    if alt.exists() and not force:
+        print(f"  Loading Cell2Cell from {alt} …")
+        return pd.read_csv(alt, low_memory=False)
+
     if RAW_PATH.exists() and not force:
         print(f"  Loading Cell2Cell from {RAW_PATH} …")
         return pd.read_csv(RAW_PATH, low_memory=False)
@@ -254,10 +261,81 @@ def _generate_synthetic(n: int = 71047, seed: int = 42) -> pd.DataFrame:
 def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     """
     Clean, encode, and engineer features from Cell2Cell schema.
+    Handles both the synthetic schema (lowercase short names) and the
+    real Cell2Cell dataset schema (CamelCase long names).
     Returns a fully numeric DataFrame ready for modeling.
     """
     df = df.copy()
     df.columns = df.columns.str.lower().str.strip()
+
+    # ── Normalise real Cell2Cell column names → internal names ────────────────
+    # The published dataset uses CamelCase long names; map them to the short
+    # names the rest of the pipeline expects.
+    RENAME = {
+        "churnlabel":               "churndep",
+        "monthsinservice":          "months",
+        "uniquesubs":               "uniqsubs",
+        "activesubs":               "actvsubs",
+        "monthlyrevenue":           "revenue",
+        "monthlyminutes":           "mou",
+        "totalrecurringcharge":     "recchrge",
+        "directorassistedcalls":    "directas",
+        "overageminutes":           "overage",
+        "roamingcalls":             "roam",
+        "percchangeminutes":        "changem",
+        "percchangerevenues":       "changer",
+        "droppedcalls":             "dropvce",
+        "blockedcalls":             "blckvce",
+        "unansweredcalls":          "unansvce",
+        "customercarecalls":        "custcare",
+        "threewaycalls":            "threeway",
+        "receivedcalls":            "mourec",
+        "outboundcalls":            "outcalls",
+        "inboundcalls":             "incalls",
+        "peakcallsinout":           "peakvce",
+        "offpeakcallsinout":        "offpeakvce",
+        "droppedblockedcalls":      "dropblk",
+        "callforwardingcalls":      "callfwdv",
+        "callwaitingcalls":         "callwait",
+        "currentequipmentdays":     "eqpdays",
+        "agehh1":                   "age1",
+        "agehh2":                   "age2",
+        "handsets":                 "phones",
+        "handsetmodels":            "models",
+        "handsetprice":             "hnd_price",
+        "handsetrefurbished":       "refurb_new",
+        "handsetwebcapable":        "webcap",
+        "truckowner":               "truck",
+        "rvowner":                  "rv",
+        "homeownership":            "ownrent",
+        "retentioncalls":           "retcalls",
+        "retentionoffersaccepted":  "retaccpt",
+        "newcellphoneuser":         "newcelly",
+        "notnewcellphoneuser":      "newcelln",
+        "referralsmadebysubscriber":"numbcars",   # closest proxy
+        "incomegroup":              "income",
+        "ownscomputer":             "pcown",
+        "hascreditcard":            "creditcd",
+        "buysviamailorder":         "mailorder",
+        "respondstomail offers":    "mailres",
+        "respondstomailoffers":     "mailres",
+        "optoutmailings":           "mailord",
+        "nonustravel":              "forgntvl",
+        "ownsMotorcycle":           "mtrcycle",
+        "ownsmotorcycle":           "mtrcycle",
+        "adjustmentstocreditrating":"creditrating",
+        "madecalltoretentionteam":  "madecall",
+        "creditrating":             "crclscod",
+        "prizmcode":                "prizm_social_one",
+        "occupation":               "occup",
+        "maritalstatus":            "marital",
+        "servicearea":              "area",
+        "childreninh h":            "kid0_2",
+        "childreninhh":             "kid0_2",
+        "numberof references":      "lor",
+        "numberofreferences":       "lor",
+    }
+    df = df.rename(columns={k: v for k, v in RENAME.items() if k in df.columns})
 
     # Drop identifier
     df = df.drop(columns=["customerid"], errors="ignore")
@@ -276,16 +354,17 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
 
     # Encode binary flags
     for col in ["asl_flag", "refurb_new", "creditcd", "mailorder",
-                "webcap", "truck", "rv", "ownrent", "forgntvl"]:
-        if col in df.columns:
-            if df[col].dtype == object:
-                pos = df[col].mode()[0]
-                df[col] = (df[col] == pos).astype(int)
+                "webcap", "truck", "rv", "ownrent", "forgntvl",
+                "kid0_2", "mailres", "mailord", "pcown",
+                "newcelly", "newcelln", "mtrcycle", "madecall"]:
+        if col in df.columns and df[col].dtype == object:
+            pos = df[col].mode()[0]
+            df[col] = (df[col] == pos).astype(int)
 
     # One-hot encode categoricals that remain
     cat_cols = [c for c in ["crclscod", "area", "hnd_webcap", "marital",
                              "creditcd", "occup", "dwlltype", "ethnic",
-                             "refurb_new"]
+                             "refurb_new", "prizm_social_one"]
                 if c in df.columns and df[c].dtype == object]
     if cat_cols:
         df = pd.get_dummies(df, columns=cat_cols, drop_first=False)
@@ -312,8 +391,13 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     if "recchrge" in df.columns:
         df["overage_rate"] = df["overage"] / (df["recchrge"] + 1)
 
-    # Ensure target is int
-    df[TARGET] = df[TARGET].astype(int)
+    # Ensure target is int — real dataset uses "Yes"/"No" or 1/0
+    if df[TARGET].dtype == object:
+        df[TARGET] = df[TARGET].str.strip().str.lower().map(
+            {"yes": 1, "true": 1, "1": 1, "no": 0, "false": 0, "0": 0}
+        ).fillna(0).astype(int)
+    else:
+        df[TARGET] = df[TARGET].fillna(0).astype(int)
 
     return df
 

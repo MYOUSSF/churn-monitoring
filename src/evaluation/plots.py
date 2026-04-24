@@ -25,6 +25,7 @@ import shap
 from pathlib import Path
 from sklearn.calibration import calibration_curve
 from sklearn.metrics import auc
+from src.data.loader import TARGET
 
 warnings.filterwarnings("ignore")
 
@@ -68,7 +69,7 @@ def plot_eda(df: pd.DataFrame) -> None:
 
     # Churn balance
     ax = axes[0]
-    counts = df["churndep"].value_counts().sort_index()
+    counts = df[TARGET].value_counts().sort_index()
     bars   = ax.bar(["No churn", "Churned"], counts.values,
                     color=[C_BLUE, C_RED], width=0.5, edgecolor="white")
     ax.set_title("Class balance")
@@ -82,7 +83,7 @@ def plot_eda(df: pd.DataFrame) -> None:
     # MOU by churn
     ax = axes[1]
     for val, label, color in [(0, "No churn", C_BLUE), (1, "Churned", C_RED)]:
-        ax.hist(df.loc[df["churndep"] == val, "mou"].clip(0, 2000),
+        ax.hist(df.loc[df[TARGET] == val, "mou"].clip(0, 2000),
                 bins=40, alpha=0.65, color=color, label=label, edgecolor="white")
     ax.set_title("Minutes of use (MOU) by churn")
     ax.set_xlabel("MOU (clipped at 2000)")
@@ -92,7 +93,7 @@ def plot_eda(df: pd.DataFrame) -> None:
     # Revenue by churn
     ax = axes[2]
     for val, label, color in [(0, "No churn", C_BLUE), (1, "Churned", C_RED)]:
-        ax.hist(df.loc[df["churndep"] == val, "revenue"].clip(0, 200),
+        ax.hist(df.loc[df[TARGET] == val, "revenue"].clip(0, 200),
                 bins=40, alpha=0.65, color=color, label=label, edgecolor="white")
     ax.set_title("Monthly revenue by churn")
     ax.set_xlabel("Revenue ($)")
@@ -123,8 +124,8 @@ def plot_horizon_rates(df: pd.DataFrame) -> None:
                 bar.get_height() + 0.005,
                 f"{rate:.1%}", ha="center", fontsize=11, fontweight="bold")
 
-    ax.axhline(df["churndep"].mean(), ls="--", color=C_GRAY, lw=1.5,
-               label=f"Snapshot churn rate ({df['churndep'].mean():.1%})")
+    ax.axhline(df[TARGET].mean(), ls="--", color=C_GRAY, lw=1.5,
+               label=f"Snapshot churn rate ({df[TARGET].mean():.1%})")
     ax.legend()
     plt.tight_layout()
     fig.savefig(PLOT_DIR / "02_horizon_churn_rates.png", dpi=150, bbox_inches="tight")
